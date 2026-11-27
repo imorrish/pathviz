@@ -1,9 +1,7 @@
 package main
 
 import (
-	"net"
 	"net/netip"
-	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -11,13 +9,6 @@ import (
 	"sync"
 	"time"
 )
-
-// Iface is a network interface of the machine.
-type Iface struct {
-	Name  string   `json:"name"`
-	Up    bool     `json:"up"`
-	Addrs []string `json:"addrs"`
-}
 
 // SocketInfo is a socket a process waits for traffic on.
 type SocketInfo struct {
@@ -30,12 +21,6 @@ type Process struct {
 	PID     int          `json:"pid"`
 	Name    string       `json:"name"`
 	Sockets []SocketInfo `json:"sockets"`
-}
-
-// HostState is what the page draws around the hooks.
-type HostState struct {
-	Ifaces []Iface   `json:"ifaces"`
-	Procs  []Process `json:"procs"`
 }
 
 // Owner is the process that owns the local socket of a packet.
@@ -114,19 +99,21 @@ func parseSS(out string) []sock {
 	return socks
 }
 
-// SocketTable knows which process owns which socket. It is a snapshot of
-// the ss output that is refreshed on a timer and on a failed lookup.
+// SocketTable knows which process owns which socket of a network namespace.
+// It is a snapshot of the ss output that is refreshed on a timer and on a
+// failed lookup.
 type SocketTable struct {
 	hidePorts map[int]bool
 
 	mu    sync.Mutex
+	ns    Netns
 	socks []sock
 	last  time.Time
 }
 
 // NewSocketTable creates a table. Sockets on the hidden ports are never reported.
-func NewSocketTable(hidePorts []int) *SocketTable {
-	t := &SocketTable{hidePorts: map[int]bool{}}
+func NewSocketTable(ns Netns, hidePorts []int) *SocketTable {
+	t := &SocketTable{ns: ns, hidePorts: map[int]bool{}}
 	for _, p := range hidePorts {
 		t.hidePorts[p] = true
 	}
@@ -135,7 +122,10 @@ func NewSocketTable(hidePorts []int) *SocketTable {
 
 // Refresh reloads the table.
 func (t *SocketTable) Refresh() error {
-	out, err := exec.Command("ss", "-H", "-n", "-a", "-t", "-u", "-p").Output()
+	t.mu.Lock()
+	ns := t.ns
+	t.mu.Unlock()
+	out, err := ns.output(4*time.Second, "ss", "-H", "-n", "-a", "-t", "-u", "-p")
 	if err != nil {
 		return err
 	}
@@ -200,21 +190,16 @@ func (t *SocketTable) Owner(proto string, local, peer netip.AddrPort) *Owner {
 	return t.lookup(proto, local, peer)
 }
 
-// Snapshot lists the interfaces and the processes with listening sockets.
-func (t *SocketTable) Snapshot() HostState {
-	st := HostState{Ifaces: []Iface{}, Procs: []Process{}}
-	ifs, _ := net.Interfaces()
-	for _, ifc := range ifs {
-		it := Iface{Name: ifc.Name, Up: ifc.Flags&net.FlagUp != 0, Addrs: []string{}}
-		addrs, _ := ifc.Addrs()
-		for _, a := range addrs {
-			if p, err := netip.ParsePrefix(a.String()); err == nil && !p.Addr().IsLinkLocalUnicast() {
-				it.Addrs = append(it.Addrs, p.Addr().String())
-			}
-		}
-		st.Ifaces = append(st.Ifaces, it)
-	}
+// SetNetns updates the way into the namespace.
+func (t *SocketTable) SetNetns(ns Netns) {
+	t.mu.Lock()
+	t.ns = ns
+	t.mu.Unlock()
+}
 
+// Procs lists the processes with listening sockets.
+func (t *SocketTable) Procs() []Process {
+	procs := []Process{}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	byPID := map[int]*Process{}
@@ -243,35 +228,39 @@ func (t *SocketTable) Snapshot() HostState {
 			}
 			return p.Sockets[a].Proto < p.Sockets[b].Proto
 		})
-		st.Procs = append(st.Procs, *p)
+		procs = append(procs, *p)
 	}
-	sort.Slice(st.Procs, func(a, b int) bool {
-		pa, pb := st.Procs[a], st.Procs[b]
+	sort.Slice(procs, func(a, b int) bool {
+		pa, pb := procs[a], procs[b]
 		if pa.Sockets[0].Port != pb.Sockets[0].Port {
 			return pa.Sockets[0].Port < pb.Sockets[0].Port
 		}
 		return pa.PID < pb.PID
 	})
-	return st
+	return procs
 }
 
 // ResolveOwners finds the local processes at the ends of a journey.
 func (t *SocketTable) ResolveOwners(j *Journey) {
-	first, last := j.Hops[0], j.Hops[len(j.Hops)-1]
-	if first.Hook == "OUTPUT" && !j.Partial {
+	s := j.IP
+	if s == nil {
+		return
+	}
+	first, last := j.Hops[s.Hops[0]], j.Hops[s.Hops[len(s.Hops)-1]]
+	if first.Hook == "OUTPUT" && !s.Partial {
 		// A locally generated packet: the source socket is ours.
 		local, err1 := netip.ParseAddrPort(first.Src)
 		peer, err2 := netip.ParseAddrPort(first.Dst)
 		if err1 == nil && err2 == nil {
-			j.From = t.Owner(j.Proto, local, peer)
+			s.From = t.Owner(j.Proto, local, peer)
 		}
 	}
-	if j.Verdict == VerdictDelivered {
+	if s.Verdict == VerdictDelivered {
 		// The addresses after all rewrites tell which socket gets the packet.
 		local, err1 := netip.ParseAddrPort(last.Dst)
 		peer, err2 := netip.ParseAddrPort(last.Src)
 		if err1 == nil && err2 == nil {
-			j.To = t.Owner(j.Proto, local, peer)
+			s.To = t.Owner(j.Proto, local, peer)
 		}
 	}
 }

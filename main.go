@@ -1,9 +1,10 @@
-// Command pathviz shows which netfilter stages a packet crosses on this machine.
+// Command pathviz shows the path of a packet through the Linux network stack.
 //
-// It installs a dedicated nftables table with one probe chain in front of every
-// classic iptables stage (raw, mangle, nat, filter in each hook). The probes log
-// the selected traffic to an NFLOG group, pathviz groups the log events by packet,
-// and a web page draws the path of every packet.
+// It installs nftables tables of its own with probe chains at the hooks a
+// packet crosses: the ingress and egress hooks of the devices (L1), the hooks
+// of the bridges (L2), and the IP hooks with their classic iptables stages
+// (L3). The probes log the selected traffic to an NFLOG group, pathviz groups
+// the log events by packet, and a web page draws the path of every packet.
 package main
 
 import (
@@ -27,7 +28,7 @@ import (
 // version is set by the release build (see .goreleaser.yaml).
 var version = "dev"
 
-const usage = `pathviz - see which netfilter stages a packet crosses
+const usage = `pathviz - see the path of a packet through the Linux network stack
 
 Usage:
   pathviz [run] [flags]      Install the probes and serve the web UI (needs root)
@@ -35,16 +36,28 @@ Usage:
   pathviz cleanup            Remove the probes left behind by a killed pathviz
   pathviz version            Print the version and exit
 
-Flags of "run" and "rules":
-  --proto any|tcp|udp|icmp   Protocol to trace (default any)
-  --ip <addr|cidr>[,...]     Trace packets from or to these addresses
-  --iface <name>[,...]       Trace packets that enter or leave through these interfaces
-                             (in:<name> only entering, out:<name> only leaving)
-  --port <port>[,...]        Trace packets from or to these ports
+What to trace ("run" and "rules"). The page can change it later:
+  --proto <name>[,...]       Protocols: arp, ip, ip6, tcp, udp, icmp, other
+                             (default: all of them)
+  --ip <addr|cidr>[,...]     Packets from or to these addresses
+  --mac <addr>[,...]         Frames from or to these MAC addresses
+  --iface <name>[,...]       Packets that enter or leave through these devices
+                             (in:<name> only entering, out:<name> only leaving).
+                             The name of a bridge selects all that crosses it
+  --port <port>[,...]        TCP and UDP packets from or to these ports
+
+Where to trace:
+  --netns <name>             The network namespace to show first: a name of
+                             "ip netns", the name of a container or a pod, or
+                             pid:<n> for the namespace of a process (default:
+                             the namespace pathviz runs in). The page can
+                             switch to any other namespace of the machine
+  --layers <l1,l2,l3>        The layers to probe: l1 is the devices, l2 the
+                             bridges, l3 the IP hooks (default: all three)
+
+Other flags:
   --listen <addr>            Address of the web UI (default 127.0.0.1:7070)
   --group <n>                NFLOG group to use (default 77)
-
-Flags of "run":
   --token-file <path>        Take the access token of the web UI from this file
                              (or from PATHVIZ_TOKEN) instead of a new random one.
                              At least 16 characters, in a file only you can read
@@ -59,6 +72,8 @@ Examples:
   sudo pathviz
   sudo pathviz --proto tcp --port 8080
   sudo pathviz --ip 172.16.0.10 --proto icmp
+  sudo pathviz --iface docker0 --proto arp,ip
+  sudo pathviz --netns web
 `
 
 func main() {
@@ -75,7 +90,7 @@ func main() {
 	case "rules":
 		err = cmdRun(args, true)
 	case "cleanup":
-		err = RemoveProbes()
+		err = cmdCleanup()
 	case "version":
 		fmt.Println(version)
 	case "help":
@@ -87,6 +102,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "pathviz:", err)
 		os.Exit(1)
 	}
+}
+
+// cmdCleanup removes the probes from every network namespace of the machine.
+func cmdCleanup() error {
+	var firstErr error
+	for _, ns := range discoverNetns() {
+		if err := RemoveProbes(ns); err != nil && ns.Home && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func newFlagSet(name string) *flag.FlagSet {
@@ -103,12 +129,36 @@ func splitList(s string) []string {
 	return out
 }
 
+// parseLayers validates the --layers flag and puts the layers in order.
+func parseLayers(s string) ([]string, error) {
+	want := map[string]bool{}
+	for _, l := range splitList(strings.ToLower(s)) {
+		if _, ok := layerFamily[l]; !ok {
+			return nil, fmt.Errorf("unknown layer %q (use l1, l2, or l3)", l)
+		}
+		want[l] = true
+	}
+	var out []string
+	for _, l := range allLayers {
+		if want[l] {
+			out = append(out, l)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no layer to probe")
+	}
+	return out, nil
+}
+
 func cmdRun(args []string, rulesOnly bool) error {
 	fs := newFlagSet("run")
-	proto := fs.String("proto", "any", "")
+	protos := fs.String("proto", "", "")
 	ips := fs.String("ip", "", "")
+	macs := fs.String("mac", "", "")
 	ports := fs.String("port", "", "")
 	ifaces := fs.String("iface", "", "")
+	netns := fs.String("netns", "", "")
+	layerList := fs.String("layers", "l1,l2,l3", "")
 	listen := fs.String("listen", "127.0.0.1:7070", "")
 	group := fs.Int("group", 77, "")
 	noPacketView := fs.Bool("no-packet-view", false, "")
@@ -123,8 +173,12 @@ func cmdRun(args []string, rulesOnly bool) error {
 	if *group < 1 || *group > 65535 {
 		return fmt.Errorf("bad NFLOG group %d", *group)
 	}
+	layers, err := parseLayers(*layerList)
+	if err != nil {
+		return err
+	}
 
-	f := Filter{Proto: *proto, IPs: splitList(*ips), Ifaces: splitList(*ifaces)}
+	f := Filter{Protos: splitList(*protos), IPs: splitList(*ips), MACs: splitList(*macs), Ifaces: splitList(*ifaces)}
 	for _, p := range splitList(*ports) {
 		n, err := strconv.Atoi(p)
 		if err != nil {
@@ -144,10 +198,17 @@ func cmdRun(args []string, rulesOnly bool) error {
 	if err != nil || uiPort < 1 || uiPort > 65535 {
 		return fmt.Errorf("bad --listen port %q", uiPortStr)
 	}
-	skipPorts := []int{uiPort}
+	opts := Options{Group: *group, PacketView: !*noPacketView, SkipPorts: []int{uiPort}, Layers: layers}
 
 	if rulesOnly {
-		fmt.Print(Ruleset(f, *group, skipPorts))
+		// The rules are printed for the devices of this namespace, as for a
+		// kernel that has the egress hook.
+		ro := RuleOptions{Group: opts.Group, SkipPorts: opts.SkipPorts, Layers: layers, Egress: true}
+		ifs, _ := net.Interfaces()
+		for _, ifc := range ifs {
+			ro.Devices = append(ro.Devices, ifc.Name)
+		}
+		fmt.Print(BuildRules(f, ro).Text())
 		return nil
 	}
 	fileToken := ""
@@ -167,63 +228,38 @@ func cmdRun(args []string, rulesOnly bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	app := &App{group: *group, packetView: !*noPacketView, skipPorts: skipPorts, subs: map[chan []byte]bool{}, sockets: NewSocketTable(skipPorts)}
-	app.token = token
-	app.RefreshHost()
-
-	// The tracker must not wait for the socket lookups of a finished journey,
-	// so the journeys go through a queue.
-	finished := make(chan *Journey, 4096)
-	tracker := NewTracker(func(j *Journey) { finished <- j })
-	go func() {
-		for j := range finished {
-			app.OnJourney(j)
+	inv := NewInventory()
+	if err := inv.Refresh(); err != nil {
+		return err
+	}
+	home, _ := inv.Find("")
+	if opts.has(L1) {
+		opts.Egress = egressSupported(home)
+		if !opts.Egress {
+			log.Printf("this kernel has no egress hook for devices (it needs Linux 5.16 or later with CONFIG_NETFILTER_EGRESS), so only their ingress hook is probed")
 		}
+	}
+	hub := NewHub(ctx, opts, inv, f)
+	hub.Tick()
+	// The observers are closed with the probes removed, whatever ends the run.
+	defer func() {
+		stop()
+		hub.Close()
+		log.Printf("probes removed")
 	}()
+	first, err := hub.Observe(*netns, true)
+	if err != nil {
+		return err
+	}
 	go func() {
-		tick := time.NewTicker(2 * time.Second)
+		tick := time.NewTicker(time.Second)
 		defer tick.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				app.RefreshHost()
-			}
-		}
-	}()
-
-	// Bind to the NFLOG group before the probes exist, so no event is missed.
-	capture, err := StartCapture(ctx, *group, tracker, !*noPacketView)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		stop() // let the reader see the cancelled context before the socket closes
-		capture.Close()
-	}()
-	app.lostFn = capture.LostEvents
-
-	if err := app.SetFilter(f); err != nil {
-		return err
-	}
-	defer func() {
-		if err := RemoveProbes(); err != nil {
-			log.Printf("cannot remove the probes: %v", err)
-		} else {
-			log.Printf("probes removed")
-		}
-	}()
-
-	go func() {
-		tick := time.NewTicker(50 * time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-tick.C:
-				tracker.Flush(now)
+				hub.Tick()
 			}
 		}
 	}()
@@ -232,18 +268,19 @@ func cmdRun(args []string, rulesOnly bool) error {
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: app.Handler()}
+	server := &Server{token: token, hub: hub, opts: opts, netns: first.id}
+	srv := &http.Server{Handler: server.Handler()}
 	go func() {
 		<-ctx.Done()
 		srv.Close()
 	}()
-	log.Printf("probes installed (nft list table inet %s)", tableName)
+	log.Printf("probes installed in the namespace %s (nft list tables | grep %s)", first.id, tableName)
 	switch {
 	case ownToken:
 		// A token that outlives this run is kept out of the log.
 		log.Printf("web UI on http://%s/?token=<your token>", ln.Addr())
-	case app.token != "":
-		log.Printf("web UI on http://%s/?token=%s", ln.Addr(), app.token)
+	case token != "":
+		log.Printf("web UI on http://%s/?token=%s", ln.Addr(), token)
 	default:
 		log.Printf("web UI on http://%s", ln.Addr())
 		log.Printf("WARNING: the access token is off (--dangerously-skip-token). Everyone who can reach %s can read the traced packets and change the filter.", *listen)

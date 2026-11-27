@@ -10,131 +10,61 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 //go:embed web
 var webFS embed.FS
 
-// backlogSize is how many finished journeys a newly opened page receives.
-const backlogSize = 300
-
-// App is the state shared by the capture side and the HTTP side.
-type App struct {
+// Server is the HTTP side of pathviz: the page and its API.
+type Server struct {
 	// token is the secret every API request must carry. It is empty when the
 	// check is off (--dangerously-skip-token).
 	token string
-
-	group int
-	// packetView tells whether the bytes of the traced packets are kept and served.
-	packetView bool
-	skipPorts  []int
-	lostFn     func() uint64
-	sockets    *SocketTable
-
-	mu      sync.Mutex
-	filter  Filter
-	ruleset string
-	backlog []*Journey
-	host    HostState
-	hostKey string
-	subs    map[chan []byte]bool
+	hub   *Hub
+	opts  Options
+	// netns is the namespace that a page shows unless it asks for another.
+	netns string
 }
 
-type message struct {
-	Type string `json:"type"`
-	Data any    `json:"data"`
-}
-
+// hello is the first message of an event stream: all that a page needs to
+// draw itself.
 type hello struct {
-	Host   string    `json:"host"`
-	Hooks  []Hook    `json:"hooks"`
-	State  HostState `json:"state"`
-	Filter Filter    `json:"filter"`
+	Host string `json:"host"`
+	// Spaces are the namespaces the page can switch to.
+	Spaces []Space `json:"spaces"`
+	// Layers are the layers that pathviz probes, and Egress tells whether the
+	// kernel has the egress hook of devices.
+	Layers []string `json:"layers"`
+	Egress bool     `json:"egress"`
+	Hooks  []Hook   `json:"hooks"`
 	// PacketView tells the page whether it can ask for the bytes of a packet.
-	PacketView bool       `json:"packetView"`
-	Journeys   []*Journey `json:"journeys"`
+	PacketView bool `json:"packetView"`
+	snapshot
 }
 
-func encode(typ string, data any) []byte {
-	b, _ := json.Marshal(message{typ, data})
-	return b
+// observer returns the observer of the namespace a request asks for.
+func (s *Server) observer(w http.ResponseWriter, r *http.Request) *Observer {
+	name := r.URL.Query().Get("netns")
+	if name == "" {
+		name = s.netns
+	}
+	o, err := s.hub.Observe(name, false)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return nil
+	}
+	return o
 }
 
-// broadcast sends a message to all open pages. A page that cannot keep up is
-// disconnected and reloads the backlog when it reconnects. The caller holds a.mu.
-func (a *App) broadcast(msg []byte) {
-	for ch := range a.subs {
-		select {
-		case ch <- msg:
-		default:
-			delete(a.subs, ch)
-			close(ch)
-		}
-	}
-}
-
-// RefreshHost reloads the interfaces and the sockets and tells the open pages
-// when they changed.
-func (a *App) RefreshHost() {
-	if err := a.sockets.Refresh(); err != nil {
-		return
-	}
-	st := a.sockets.Snapshot()
-	key, _ := json.Marshal(st)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if string(key) == a.hostKey {
-		return
-	}
-	a.host, a.hostKey = st, string(key)
-	a.broadcast(encode("host", st))
-}
-
-// OnJourney stores a finished journey and pushes it to the open pages.
-func (a *App) OnJourney(j *Journey) {
-	a.mu.Lock()
-	keep := a.filter.Keeps(j)
-	a.mu.Unlock()
-	if !keep {
-		return
-	}
-	a.sockets.ResolveOwners(j)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.backlog = append(a.backlog, j)
-	if len(a.backlog) > backlogSize {
-		a.backlog = a.backlog[len(a.backlog)-backlogSize:]
-	}
-	a.broadcast(encode("journey", j))
-}
-
-// SetFilter validates the filter and reinstalls the probes for it.
-func (a *App) SetFilter(f Filter) error {
-	if err := f.Normalize(); err != nil {
-		return err
-	}
-	ruleset := Ruleset(f, a.group, a.skipPorts)
-	if err := InstallProbes(ruleset); err != nil {
-		return err
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.ruleset != "" && a.ruleset != ruleset {
-		// The packets traced so far belong to the previous filter.
-		a.backlog = nil
-		a.broadcast(encode("clear", nil))
-	}
-	a.filter, a.ruleset = f, ruleset
-	a.broadcast(encode("filter", f))
-	return nil
-}
-
-func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
+		return
+	}
+	o := s.observer(w, r)
+	if o == nil {
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -142,24 +72,14 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	host, _ := os.Hostname()
-	ch := make(chan []byte, 1024)
-	a.mu.Lock()
-	first := encode("hello", hello{Host: host, Hooks: Hooks, State: a.host, Filter: a.filter, PacketView: a.packetView, Journeys: a.backlog})
-	a.subs[ch] = true
-	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		if a.subs[ch] {
-			delete(a.subs, ch)
-		}
-		a.mu.Unlock()
-	}()
+	ch, snap := o.subscribe()
+	defer o.unsubscribe(ch)
 
 	send := func(msg []byte) {
 		fmt.Fprintf(w, "data: %s\n\n", msg)
 		fl.Flush()
 	}
-	send(first)
+	send(encode("hello", hello{Host: host, Spaces: s.hub.Spaces(), Layers: s.opts.Layers, Egress: s.opts.Egress, Hooks: Hooks, PacketView: s.opts.PacketView, snapshot: snap}))
 	tick := time.NewTicker(2 * time.Second)
 	defer tick.Stop()
 	for {
@@ -172,7 +92,7 @@ func (a *App) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			send(msg)
 		case <-tick.C:
-			send(encode("stats", map[string]uint64{"lost": a.lostFn()}))
+			send(encode("stats", map[string]uint64{"lost": o.Lost()}))
 		}
 	}
 }
@@ -197,7 +117,7 @@ func allowChange(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func (a *App) handleFilter(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleFilter(w http.ResponseWriter, r *http.Request) {
 	if !allowChange(w, r) {
 		return
 	}
@@ -206,33 +126,39 @@ func (a *App) handleFilter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad filter: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := a.SetFilter(f); err != nil {
+	o := s.observer(w, r)
+	if o == nil {
+		return
+	}
+	if err := o.SetFilter(f); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (a *App) handleClear(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
 	if !allowChange(w, r) {
 		return
 	}
-	a.mu.Lock()
-	a.backlog = nil
-	a.broadcast(encode("clear", nil))
-	a.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
+	if o := s.observer(w, r); o != nil {
+		o.Clear()
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
-func (a *App) handleRuleset(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	fmt.Fprint(w, a.ruleset)
+func (s *Server) handleRuleset(w http.ResponseWriter, r *http.Request) {
+	if o := s.observer(w, r); o != nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, o.Rules())
+	}
 }
 
 // packetHop is a packet as one probe saw it, split into layers and fields.
 type packetHop struct {
+	// Index is the place of the hop among the hops of the journey.
+	Index int    `json:"index"`
+	Layer string `json:"layer"`
 	Hook  string `json:"hook"`
 	Stage string `json:"stage"`
 	Exit  bool   `json:"exit,omitempty"`
@@ -240,8 +166,8 @@ type packetHop struct {
 }
 
 // handlePacket returns the bytes of a traced packet at every hop.
-func (a *App) handlePacket(w http.ResponseWriter, r *http.Request) {
-	if !a.packetView {
+func (s *Server) handlePacket(w http.ResponseWriter, r *http.Request) {
+	if !s.opts.PacketView {
 		http.Error(w, "the packet view is disabled (--no-packet-view)", http.StatusForbidden)
 		return
 	}
@@ -250,26 +176,22 @@ func (a *App) handlePacket(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad packet id", http.StatusBadRequest)
 		return
 	}
-	var j *Journey
-	a.mu.Lock()
-	for _, item := range a.backlog {
-		if item.ID == id {
-			j = item
-			break
-		}
+	o := s.observer(w, r)
+	if o == nil {
+		return
 	}
-	a.mu.Unlock()
+	j := o.Journey(id)
 	if j == nil {
 		http.Error(w, "the packet is not kept anymore", http.StatusNotFound)
 		return
 	}
-	// A finished journey does not change, so it is read without the lock.
+	// A finished journey does not change, so it is read without a lock.
 	hops := make([]packetHop, 0, len(j.Hops))
 	for i, hop := range j.Hops {
-		if i >= len(j.raw) {
-			break
+		if i >= len(j.raw) || j.raw[i] == nil {
+			continue
 		}
-		hops = append(hops, packetHop{Hook: hop.Hook, Stage: hop.Stage, Exit: hop.Exit, Dissection: Dissect(j.raw[i])})
+		hops = append(hops, packetHop{Index: i, Layer: hop.Layer, Hook: hop.Hook, Stage: hop.Stage, Exit: hop.Exit, Dissection: DissectFrame(j.raw[i], j.l2len[i])})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -277,8 +199,8 @@ func (a *App) handlePacket(w http.ResponseWriter, r *http.Request) {
 }
 
 // tokenMatches compares a value with the access token in constant time.
-func (a *App) tokenMatches(got string) bool {
-	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(a.token)) == 1
+func (s *Server) tokenMatches(got string) bool {
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
 }
 
 // authorized tells whether the request carries the access token: in the
@@ -286,26 +208,26 @@ func (a *App) tokenMatches(got string) bool {
 // headers. A cookie is not accepted, and PathViz never sets one: a browser
 // sends the cookies of a host to every port of it, so any other web server of
 // the machine that the browser visits would get the token.
-func (a *App) authorized(r *http.Request) bool {
-	if a.token == "" {
+func (s *Server) authorized(r *http.Request) bool {
+	if s.token == "" {
 		return true
 	}
-	if bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && a.tokenMatches(bearer) {
+	if bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok && s.tokenMatches(bearer) {
 		return true
 	}
-	return a.tokenMatches(r.URL.Query().Get("token"))
+	return s.tokenMatches(r.URL.Query().Get("token"))
 }
 
 // Handler returns the HTTP handler of the UI and its API. The files of the
 // page hold no secrets and are open to everyone. The API is not: without the
 // token the page can neither see a packet nor change anything.
-func (a *App) Handler() http.Handler {
+func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
-	api.HandleFunc("/api/events", a.handleEvents)
-	api.HandleFunc("/api/filter", a.handleFilter)
-	api.HandleFunc("/api/clear", a.handleClear)
-	api.HandleFunc("/api/ruleset", a.handleRuleset)
-	api.HandleFunc("/api/packet", a.handlePacket)
+	api.HandleFunc("/api/events", s.handleEvents)
+	api.HandleFunc("/api/filter", s.handleFilter)
+	api.HandleFunc("/api/clear", s.handleClear)
+	api.HandleFunc("/api/ruleset", s.handleRuleset)
+	api.HandleFunc("/api/packet", s.handlePacket)
 	// The page asks this one whether its token is right.
 	api.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
@@ -315,10 +237,12 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		// The address of the page can hold the token: it must not leak to other sites.
 		w.Header().Set("Referrer-Policy", "no-referrer")
+		// The page is small and changes with every release of pathviz.
+		w.Header().Set("Cache-Control", "no-cache")
 		files.ServeHTTP(w, r)
 	})
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if !a.authorized(r) {
+		if !s.authorized(r) {
 			http.Error(w, "the access token is missing or wrong", http.StatusUnauthorized)
 			return
 		}

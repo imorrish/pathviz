@@ -1,0 +1,140 @@
+# The playground of the containers demo: one machine per container runtime.
+#
+#   dev        (172.16.0.10) - the Go toolchain and the sources
+#   docker     (172.16.0.20) - Docker bridge networks
+#   podman     (172.16.0.30) - a Podman bridge network, with a pod
+#   containerd (172.16.0.40) - containerd with nerdctl (a CNI bridge)
+#   crio       (172.16.0.50) - CRI-O pods started with crictl (a CNI bridge)
+#
+# Start it and copy the sources to dev with "make playground DEMO=containers"
+# (in the root of the repository). Then run "make demo-containers" on dev.
+# Every other machine then has pathviz on its port 7070, and the playground
+# has a tab for each.
+kind: playground
+name: flexbox
+playground:
+  networks:
+    - name: local
+      subnet: 172.16.0.0/24
+  machines:
+    - name: dev
+      users:
+        - name: root
+        - name: laborant
+          default: true
+      drives:
+        - source: golang
+          mount: /
+          size: 30GiB
+      network:
+        interfaces:
+          - network: local
+            address: 172.16.0.10/24
+      resources:
+        cpuCount: 2
+        ramSize: 4GiB
+    - name: docker
+      users:
+        - name: root
+        - name: laborant
+          default: true
+      drives:
+        - source: docker
+          mount: /
+          size: 30GiB
+      network:
+        interfaces:
+          - network: local
+            address: 172.16.0.20/24
+      resources:
+        cpuCount: 2
+        ramSize: 2GiB
+    - name: podman
+      users:
+        - name: root
+        - name: laborant
+          default: true
+      drives:
+        - source: podman
+          mount: /
+          size: 30GiB
+      network:
+        interfaces:
+          - network: local
+            address: 172.16.0.30/24
+      resources:
+        cpuCount: 2
+        ramSize: 2GiB
+    - name: containerd
+      users:
+        - name: root
+        - name: laborant
+          default: true
+      drives:
+        - source: nerdctl
+          mount: /
+          size: 30GiB
+      network:
+        interfaces:
+          - network: local
+            address: 172.16.0.40/24
+      resources:
+        cpuCount: 2
+        ramSize: 2GiB
+    - name: crio
+      users:
+        - name: root
+        - name: laborant
+          default: true
+      drives:
+        - source: k8s-omni-node
+          mount: /
+          size: 30GiB
+      network:
+        interfaces:
+          - network: local
+            address: 172.16.0.50/24
+      resources:
+        cpuCount: 2
+        ramSize: 4GiB
+  tabs:
+    - id: terminal-dev
+      kind: terminal
+      name: dev
+      machine: dev
+    - id: pathviz-docker
+      kind: http-port
+      name: pathviz docker
+      machine: docker
+      number: 7070
+    - id: pathviz-podman
+      kind: http-port
+      name: pathviz podman
+      machine: podman
+      number: 7070
+    - id: pathviz-containerd
+      kind: http-port
+      name: pathviz containerd
+      machine: containerd
+      number: 7070
+    - id: pathviz-crio
+      kind: http-port
+      name: pathviz cri-o
+      machine: crio
+      number: 7070
+    - id: terminal-docker
+      kind: terminal
+      name: docker
+      machine: docker
+    - id: terminal-podman
+      kind: terminal
+      name: podman
+      machine: podman
+    - id: terminal-containerd
+      kind: terminal
+      name: containerd
+      machine: containerd
+    - id: terminal-crio
+      kind: terminal
+      name: crio
+      machine: crio

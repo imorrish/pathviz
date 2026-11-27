@@ -6,104 +6,160 @@
 <title>PathViz</title>
 <link rel="icon" href="data:,">
 <script>
-  // ?theme=dark or ?theme=light forces the colors. Without it, they follow the system.
+  // ?theme=dark or ?theme=light forces the colors. Without it, the full view
+  // uses what its switch was set to, and everything else follows the system.
   (function () {
-    var theme = new URLSearchParams(location.search).get('theme');
+    var params = new URLSearchParams(location.search);
+    var theme = params.get('theme');
+    if (!theme && params.get('view') !== 'embed') {
+      try { theme = localStorage.getItem('pathviz.theme'); } catch (e) { /* no storage: the system decides */ }
+    }
     if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme;
   })();
 </script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<!-- The header has three rows: what to look at (the layer), what to trace (the
+     namespace and the filter), and how to show it. The last two are named on
+     their left. An embedded view keeps only a part of the last one. In a narrow
+     window, a row is folded down to its name (with what is traced, or with the
+     connection), and the name is a button that unfolds its controls. -->
 <header class="bar">
-  <div class="brand">
+  <div class="line brandline">
     <h1>pathviz</h1>
+    <div id="mode-switch" class="viewswitch" role="group" aria-label="Layer"></div>
+    <span class="spacer"></span>
+    <button type="button" id="theme-btn" class="icon" aria-label="Switch between the light and the dark colors">
+      <svg class="sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></svg>
+      <svg class="moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z"/></svg>
+    </button>
     <button type="button" id="help-btn" class="icon" aria-label="How PathViz works" title="How PathViz works">?</button>
   </div>
-  <form id="filter" class="filter" autocomplete="off">
+
+  <form id="filter" class="row filter" autocomplete="off">
+    <button type="button" id="filter-more" class="rowname" aria-expanded="false" aria-controls="filter-body">Filter</button>
+    <div id="filter-body" class="rowbody">
+    <label class="netns">Namespace
+      <select id="f-netns" aria-label="The network namespace to watch"></select>
+    </label>
     <label>Protocol
       <select id="f-proto">
-        <option value="any">Any</option>
+        <option value="">Any</option>
         <option value="tcp">TCP</option>
         <option value="udp">UDP</option>
         <option value="icmp">ICMP</option>
+        <option value="arp">ARP</option>
+        <option value="ip">IPv4</option>
+        <option value="ip6">IPv6</option>
+        <option value="arp,ip">ARP and IPv4</option>
+        <option value="arp,ip,other">All but IPv6</option>
+        <option value="other">Not ARP, IPv4, or IPv6</option>
       </select>
     </label>
     <label>Interfaces
-      <input id="f-ifaces" type="text" placeholder="eth0, in:eth0" spellcheck="false">
+      <input id="f-ifaces" type="text" placeholder="eth0, in:eth0, br0" spellcheck="false">
     </label>
-    <label>Addresses
+    <label>MAC addresses
+      <input id="f-macs" type="text" placeholder="Any MAC" spellcheck="false">
+    </label>
+    <label>IP addresses
       <input id="f-ips" type="text" placeholder="Any address" spellcheck="false">
     </label>
     <label>Ports
       <input id="f-ports" type="text" placeholder="Any port" spellcheck="false" inputmode="numeric">
     </label>
     <button type="submit" class="primary" id="apply-btn" disabled>Apply filter</button>
-    <span id="filter-msg" role="status"></span>
+    </div>
+    <!-- What is traced right now, in words, and what came of the last change. -->
+    <p class="traceline"><span id="tracing"></span><span id="filter-msg" role="status"></span></p>
   </form>
-  <p class="tracing"><strong id="tracing"></strong> <span class="hint">Click an interface, a process, or a socket to trace only its traffic. It applies right away.</span></p>
-  <!-- The speed is a dropdown, and chips next to the Apply button on small screens. -->
-  <div class="speed">
-    <label class="lbl" for="speed-select-full">Speed</label>
-    <select id="speed-select-full" class="speed-select" aria-label="How fast a packet travels through the diagram"></select>
-    <div id="speed-chips" class="chips viewswitch" role="group" aria-label="How fast a packet travels through the diagram"></div>
+
+  <div class="row viewline">
+    <button type="button" id="view-more" class="rowname" aria-expanded="false" aria-controls="view-body">Display</button>
+    <div id="view-body" class="rowbody">
+    <span id="embed-group" class="group" hidden>
+      <span class="lbl">View</span>
+      <span id="embed-switch" class="viewswitch" role="group" aria-label="View">
+        <button type="button" data-show="diagram" aria-pressed="true">Path</button>
+        <button type="button" data-show="tables" aria-pressed="false" id="embed-tables">Packets</button>
+      </span>
+    </span>
+    <label id="preset-group" class="group">
+      <span class="lbl">Preset</span>
+      <select id="preset-select" aria-label="A filter and a look for a common setup"></select>
+    </label>
+    <span id="sub-group" class="group">
+      <span class="lbl">Look</span>
+      <span id="sub-switch" class="viewswitch" role="group" aria-label="Look of the diagram"></span>
+    </span>
+    <span id="layer-group" class="group">
+      <span class="lbl">Layers</span>
+      <span id="layer-switch" class="toggles" role="group" aria-label="Layers to show"></span>
+    </span>
+    <span id="panel-group" class="group">
+      <span class="lbl">Show</span>
+      <span id="panel-switch" class="toggles" role="group" aria-label="Tables to show"></span>
+      <span id="detail-switch" class="toggles" role="group" aria-label="Detail of the diagram"></span>
+      <span id="block-switch" class="menus"></span>
+    </span>
+    <span class="vsep" aria-hidden="true"></span>
+    <span class="group">
+      <button type="button" id="pause-btn" class="pause" aria-pressed="false"></button>
+      <button type="button" id="step-btn" class="step" disabled>Step</button>
+    </span>
+    <label class="group">
+      <span class="lbl">Speed</span>
+      <select id="speed-select" class="speed-select" aria-label="How fast a packet travels through the diagram"></select>
+    </label>
+    <!-- How many packets wait during a pause. It fills the room that is left
+         before the connection badge, so it never moves or wraps the controls. -->
+    <span id="held-note" class="held" role="status"></span>
+    <span id="conn" class="conn" title="Connection to PathViz">Connecting</span>
+    </div>
   </div>
-  <span id="conn" class="conn" title="Connection to PathViz">Connecting</span>
 </header>
 
-<!-- The header row of an embedded view. The connection badge is moved into it. -->
-<div id="embedbar" class="embedbar" hidden>
-  <span id="view-group" class="group" hidden>
-    <span class="lbl">View</span>
-    <span id="viewswitch" class="viewswitch" role="group" aria-label="View">
-      <button type="button" data-show="diagram" aria-pressed="true">Path</button>
-      <button type="button" data-show="tables" aria-pressed="false">Packets</button>
-    </span>
-  </span>
-  <label class="group">
-    <span class="lbl">Speed</span>
-    <select id="speed-select" class="speed-select" aria-label="How fast a packet travels through the diagram"></select>
-  </label>
-  <span class="spacer"></span>
-</div>
-
 <main>
-  <section class="map" aria-label="Packet path">
-    <div id="diagram-box"><svg id="diagram" viewBox="-170 0 1540 441" preserveAspectRatio="xMidYMin meet" role="img" aria-label="Netfilter hooks and the path of the selected packet"></svg></div>
+  <section class="map" aria-label="Path">
+    <div id="tabs" class="viewswitch tabs" role="group" hidden></div>
+    <div id="diagram-box"><svg id="diagram" viewBox="0 0 1540 441" preserveAspectRatio="xMidYMin meet" role="img"></svg></div>
     <p id="verdict" class="verdict"></p>
   </section>
 
   <section class="lower">
-    <div class="packets">
-      <div class="section-head" data-table="packets" role="button" tabindex="0" aria-expanded="true">
+    <div class="panel" data-panel="packets">
+      <div class="section-head" role="button" tabindex="0" aria-expanded="true">
         <span class="chev" aria-hidden="true"></span>
-        <h2>Packets</h2>
+        <h2 id="list-title">Packets</h2>
         <span id="count" class="muted"></span>
         <span class="spacer"></span>
-        <button type="button" id="live-btn" aria-pressed="true">Following new packets</button>
+        <button type="button" id="live-btn" aria-pressed="true">Following</button>
         <button type="button" id="clear-btn">Clear</button>
       </div>
       <div class="table-wrap">
-        <table id="packets">
-          <thead><tr><th>Time</th><th>Proto</th><th>Source</th><th>Destination</th><th>Details</th><th>Outcome</th><th aria-label="Packet contents"></th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <div id="empty" class="empty">
-          <p>No packet has matched the filter yet.</p>
-        </div>
+        <table id="packets"><thead></thead><tbody></tbody></table>
+        <div id="empty" class="empty"><p>Nothing has matched the filter yet.</p></div>
       </div>
     </div>
-    <div class="hops">
-      <div class="section-head" data-table="stages" role="button" tabindex="0" aria-expanded="true">
+    <div class="panel" data-panel="details">
+      <div class="section-head" role="button" tabindex="0" aria-expanded="true">
         <span class="chev" aria-hidden="true"></span>
-        <h2 id="hops-title">Stages of the selected packet</h2><span id="hops-summary" class="muted mono"></span>
+        <h2 id="detail-title"></h2><span id="detail-summary" class="summary muted mono"></span>
       </div>
       <div class="table-wrap">
-        <table id="hops">
-          <thead><tr><th id="hops-first">Stage</th><th>In</th><th>Out</th><th>Source</th><th>Destination</th><th>TTL</th><th>Elapsed</th></tr></thead>
-          <tbody></tbody>
-        </table>
-        <div id="hops-empty" class="empty"><p>Select a packet to see what every stage saw.</p></div>
+        <table id="hops"><thead></thead><tbody></tbody></table>
+        <div id="hops-empty" class="empty"><p></p></div>
+      </div>
+    </div>
+    <div class="panel" data-panel="extra">
+      <div class="section-head" role="button" tabindex="0" aria-expanded="true">
+        <span class="chev" aria-hidden="true"></span>
+        <h2 id="extra-title"></h2><span id="extra-summary" class="summary muted mono"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="extra"><thead></thead><tbody></tbody></table>
+        <div id="extra-empty" class="empty"><p></p></div>
       </div>
     </div>
   </section>
@@ -113,17 +169,23 @@
   <h2>How PathViz works</h2>
   <h3>In plain words</h3>
   <p>A packet crosses a fixed chain of checkpoints on its way through the Linux network stack. PathViz puts an observer at every checkpoint. An observer only notes which packets passed by and never touches them.</p>
-  <p>PathViz collects the notes, finds the ones that belong to the same packet, and lights up the checkpoints this packet passed, visualizing the path of the packet in the kernel.</p>
+  <p>PathViz collects the notes, finds the ones that belong to the same packet, and lights up the checkpoints this packet passed. A packet that reached a checkpoint and was not seen at the next one was stopped in between.</p>
+  <h3>The layers</h3>
+  <ul>
+    <li><strong>Device (L1)</strong>: the ingress hook of every network device, right after the device received a frame, and the egress hook, right before the device sends one.</li>
+    <li><strong>Bridge (L2)</strong>: the five netfilter hooks of a Linux bridge. They show which ports got a copy of a frame, and why: the bridge looked the destination up in its MAC table or flooded the frame.</li>
+    <li><strong>IP (L3)</strong>: the five netfilter hooks of the IP layer and the stages inside them (raw, mangle, nat, filter), where iptables and nftables rules run.</li>
+  </ul>
   <h3>Under the hood</h3>
   <ol>
-    <li>The checkpoints are the five netfilter hooks and the stages (raw, mangle, nat, filter) inside them. iptables and nftables rules run at these stages.</li>
-    <li>PathViz installs one nftables table, <code>inet pathviz</code>. The table has a probe chain right before every stage of every hook, and one more at the end of the hook.</li>
-    <li>The first probe that sees a packet matching the filter remembers the packet's identity (the IP ID, the TCP sequence numbers, and similar fields) for half a second. The later probes recognize the packet by it, even after NAT rewrote its addresses or ports.</li>
-    <li>Every probe logs the packet to an NFLOG group and lets it go on unchanged.</li>
-    <li>PathViz reads the group, puts the records of one packet together, and draws the stages the packet was seen at. A packet that entered a stage and was never seen again is shown as stopped there.</li>
+    <li>PathViz installs one nftables table per layer, all named <code>pathviz</code>: in the <code>netdev</code>, <code>bridge</code>, and <code>inet</code> families, in the network namespace you watch.</li>
+    <li>Every table has probe chains at the start and at the end of each hook. The IP table also has one right before every stage.</li>
+    <li>A probe logs the packets that match the filter to an NFLOG group and lets them go on unchanged.</li>
+    <li>The first IP probe that sees a matching packet remembers its identity (the IP ID, the TCP sequence numbers, and similar fields) for half a second. The later IP probes recognize the packet by it, even after NAT rewrote its addresses or ports. The device and bridge probes see a packet with the addresses it has at that point.</li>
+    <li>PathViz reads the group and puts the records of one packet together. The names of the devices, the bridges' MAC tables, and what is at the other end of a veth pair (a container, a pod, a namespace) come from <code>ip</code>, <code>bridge</code>, and the container runtimes, once a second.</li>
   </ol>
   <h3>The rules it installs</h3>
-  <p>These are the rules for the current filter. The comments marked <code>[static]</code> are on the parts that are the same for every filter, and the ones marked <code>[filter]</code> are on the parts generated from the current filter. The live rules are in <code>nft list table inet pathviz</code>.</p>
+  <p>These are the rules for the current filter and namespace. The comments marked <code>[static]</code> are on the parts that are the same for every filter, and the ones marked <code>[filter]</code> are on the parts generated from the filter. The live rules are in <code>nft list ruleset | grep -A3 pathviz</code>.</p>
   <pre id="rules-text"></pre>
   <form method="dialog"><button class="primary" autofocus>Close</button></form>
 </dialog>
@@ -152,6 +214,6 @@
   </div>
 </dialog>
 
-<script src="app.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

@@ -20,6 +20,7 @@ type Field struct {
 
 // Layer kinds. The page colors the bytes of a layer by its kind.
 const (
+	LayerLink = "link"
 	LayerIP   = "ip"
 	LayerL4   = "l4"
 	LayerApp  = "app"
@@ -38,7 +39,8 @@ type Layer struct {
 
 // Dissection is a packet split into layers and fields.
 type Dissection struct {
-	// Bytes is the captured part of the packet, from the IP header on.
+	// Bytes is the captured part of the packet: from the Ethernet header on
+	// when the probe saw one, else from the IP header on.
 	Bytes []byte `json:"bytes"`
 	// Total is the real length of the packet. It is larger than the number of
 	// captured bytes when the capture cut the packet short.
@@ -48,19 +50,46 @@ type Dissection struct {
 
 // Dissect decodes the captured bytes of an IP packet. It never fails: the
 // bytes it cannot decode end up in a data layer.
-func Dissect(b []byte) Dissection {
+func Dissect(b []byte) Dissection { return DissectFrame(b, 0) }
+
+// DissectFrame decodes captured bytes that start with an Ethernet header of
+// l2len bytes, or with the IP header when l2len is 0.
+func DissectFrame(b []byte, l2len int) Dissection {
 	d := &dissector{b: b}
-	d.ip(0, false)
+	ip := true
+	if l2len >= 14 && len(b) >= l2len {
+		l := d.begin(LayerLink, "Ethernet", 0)
+		etherType := d.u16(l2len - 2)
+		d.add(l, "Destination", 0, 6, net.HardwareAddr(b[0:6]).String())
+		d.add(l, "Source", 6, 6, net.HardwareAddr(b[6:12]).String())
+		d.add(l, "EtherType", l2len-2, 2, fmt.Sprintf("%s (%s)", hex16(etherType), etherTypeName(etherType)))
+		l.Summary = fmt.Sprintf("%s → %s", net.HardwareAddr(b[6:12]), net.HardwareAddr(b[0:6]))
+		d.end(l, l2len)
+		switch etherType {
+		case 0x0800, 0x86dd:
+		case 0x0806:
+			ip = false
+			d.arp(l2len)
+		default:
+			ip = false
+			d.data("Payload", l2len, len(b))
+		}
+	} else {
+		l2len = 0
+	}
 	total := len(b)
-	if len(b) >= 1 {
-		switch b[0] >> 4 {
-		case 4:
-			if len(b) >= 4 {
-				total = max(total, int(d.u16(2)))
-			}
-		case 6:
-			if len(b) >= 6 {
-				total = max(total, 40+int(d.u16(4)))
+	if ip {
+		d.ip(l2len, false)
+		if len(b) > l2len {
+			switch b[l2len] >> 4 {
+			case 4:
+				if len(b) >= l2len+4 {
+					total = max(total, l2len+int(d.u16(l2len+2)))
+				}
+			case 6:
+				if len(b) >= l2len+6 {
+					total = max(total, l2len+40+int(d.u16(l2len+4)))
+				}
 			}
 		}
 	}
@@ -76,6 +105,29 @@ func Dissect(b []byte) Dissection {
 		d.layers = []Layer{}
 	}
 	return Dissection{Bytes: b, Total: total, Layers: d.layers}
+}
+
+// arp decodes an ARP message for Ethernet and IPv4.
+func (d *dissector) arp(off int) {
+	l := d.begin(LayerIP, "ARP", off)
+	op := d.u16(off + 6)
+	name := map[uint16]string{1: "request", 2: "reply"}[op]
+	if name == "" {
+		name = "unknown"
+	}
+	d.add(l, "Hardware type", off, 2, fmt.Sprint(d.u16(off)))
+	d.add(l, "Protocol type", off+2, 2, hex16(d.u16(off+2)))
+	d.add(l, "Hardware size", off+4, 1, fmt.Sprint(d.u8(off+4)))
+	d.add(l, "Protocol size", off+5, 1, fmt.Sprint(d.u8(off+5)))
+	d.add(l, "Operation", off+6, 2, fmt.Sprintf("%d (%s)", op, name))
+	if d.u8(off+4) == 6 && d.u8(off+5) == 4 && d.has(off, 28) {
+		d.add(l, "Sender MAC", off+8, 6, net.HardwareAddr(d.b[off+8:off+14]).String())
+		d.add(l, "Sender IP", off+14, 4, d.addr(off+14, 4))
+		d.add(l, "Target MAC", off+18, 6, net.HardwareAddr(d.b[off+18:off+24]).String())
+		d.add(l, "Target IP", off+24, 4, d.addr(off+24, 4))
+		l.Summary = name
+	}
+	d.end(l, off+28)
 }
 
 // dissector walks the packet. Its readers return zero past the end of the

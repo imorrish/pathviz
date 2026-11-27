@@ -1,9 +1,11 @@
-# Flexbox playground for developing and trying pathviz:
+# The playground of the routing demo:
 #
-#   dev    (172.16.0.10) - Go toolchain and the sources, also the external traffic source
-#   target (172.16.0.20) - the machine whose netfilter hooks are visualized
+#   dev    (172.16.0.10) - the Go toolchain and the sources. It also sends the
+#                          demo's requests
+#   target (172.16.0.20) - the machine whose hooks are shown
 #
-# Start it with: labctl playground start flexbox -f dev-playground.yaml --ssh
+# Start it and copy the sources to dev with "make playground DEMO=routing"
+# (in the root of the repository). Then run "make demo-routing" on dev.
 kind: playground
 name: flexbox
 playground:

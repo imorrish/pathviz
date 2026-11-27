@@ -1,9 +1,9 @@
 #!/bin/sh
-# The demo on a single Linux machine. Run it as root (the Makefile's "demo-local"
-# and "demo-local-stop" targets do):
+# The local demo: everything on one Linux machine. Run it as root (the
+# Makefile next to it does):
 #
-#   local.sh start <pathviz binary> [address of the web UI] [more pathviz flags]
-#   local.sh stop
+#   demo.sh start <pathviz binary> [address of the web UI] [more pathviz flags]
+#   demo.sh stop
 #
 # "start" runs a web server on port 8080, a client that sends it a request
 # every two seconds over the loopback interface, and PathViz, which traces the
@@ -33,7 +33,7 @@ start() {
 	echo "Hello from the PathViz demo!" > /tmp/pathviz-demo/index.html
 	systemd-run --quiet --unit pathviz-local-web python3 -m http.server 8080 --directory /tmp/pathviz-demo
 	since=$(date '+%Y-%m-%d %H:%M:%S')
-	systemd-run --quiet --unit pathviz-local-daemon "$bin" --listen "$listen" --proto tcp --port 8080 "$@"
+	systemd-run --quiet --unit pathviz-local-daemon "$bin" --listen "$listen" --port 8080 "$@"
 	systemd-run --quiet --unit pathviz-local-send \
 		sh -c 'while true; do curl -s -m 2 -o /dev/null http://127.0.0.1:8080/; sleep 2; done'
 
@@ -50,7 +50,7 @@ start() {
 		exit 1
 	fi
 	echo "The demo runs. The web UI is on $url"
-	echo "Stop it with: make demo-local-stop"
+	echo "Stop it with: make stop-local"
 }
 
 case "${1:-}" in

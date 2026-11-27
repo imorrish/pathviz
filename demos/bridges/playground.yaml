@@ -1,0 +1,38 @@
+# The playground of the bridges demo: one machine, dev, with the Go toolchain,
+# the sources, and the bridges of the demo.
+#
+# Start it and copy the sources to dev with "make playground DEMO=bridges"
+# (in the root of the repository). Then run "make demo-bridges" on dev.
+kind: playground
+name: flexbox
+playground:
+  networks:
+    - name: local
+      subnet: 172.16.0.0/24
+  machines:
+    - name: dev
+      users:
+        - name: root
+        - name: laborant
+          default: true
+      drives:
+        - source: golang
+          mount: /
+          size: 30GiB
+      network:
+        interfaces:
+          - network: local
+            address: 172.16.0.10/24
+      resources:
+        cpuCount: 4
+        ramSize: 4GiB
+  tabs:
+    - id: terminal-dev
+      kind: terminal
+      name: dev
+      machine: dev
+    - id: pathviz
+      kind: http-port
+      name: pathviz
+      machine: dev
+      number: 7070
